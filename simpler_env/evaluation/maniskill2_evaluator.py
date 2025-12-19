@@ -14,6 +14,8 @@ from simpler_env.utils.env.env_builder import (
 from simpler_env.utils.env.observation_utils import get_image_from_maniskill2_obs_dict
 from simpler_env.utils.visualization import write_interval_video, write_video
 
+def _base_env(env):
+    return getattr(env, "unwrapped", env)
 
 def run_maniskill2_eval_single_episode(
     model,
@@ -85,15 +87,16 @@ def run_maniskill2_eval_single_episode(
             "episode_id": obj_episode_id,
         }
     obs, _ = env.reset(options=env_reset_options)
+    base = _base_env(env)
     # for long-horizon environments, we check if the current subtask is the final subtask
-    is_final_subtask = env.is_final_subtask()
+    is_final_subtask = base.is_final_subtask()
 
     # Obtain language instruction
     if instruction is not None:
         task_description = instruction
     else:
         # get default language instruction
-        task_description = env.get_language_instruction()
+        task_description = base.get_language_instruction()
     print(task_description)
 
     # Initialize logging
@@ -113,14 +116,18 @@ def run_maniskill2_eval_single_episode(
     task_descriptions = []
     while not (predicted_terminated or truncated):
         # step the model; "raw_action" is raw model action output; "action" is the processed action to be sent into maniskill env
-        raw_action, action = model.step(image, task_description, eef_pos=obs["agent"]["eef_pos"])
+        agent = obs.get("agent", {})
+        eef_pos = agent.get("eef_pos", None)
+        if eef_pos is None:
+            eef_pos = agent.get("tcp_pos", None) or agent.get("ee_pos", None)
+        raw_action, action = model.step(image, task_description, eef_pos=eef_pos)
         predicted_actions.append(raw_action)
         predicted_terminated = bool(action["terminate_episode"][0] > 0)
         if predicted_terminated:
             if not is_final_subtask:
                 # advance the environment to the next subtask
                 predicted_terminated = False
-                env.advance_to_next_subtask()
+                base.advance_to_next_subtask()
 
         # step the environment
         obs, reward, done, truncated, info = env.step(
@@ -130,11 +137,11 @@ def run_maniskill2_eval_single_episode(
         )
 
         success = "success" if done else "failure"
-        new_task_description = env.get_language_instruction()
+        new_task_description = base.get_language_instruction()
         if new_task_description != task_description:
             task_description = new_task_description
             print(task_description)
-        is_final_subtask = env.is_final_subtask()
+        is_final_subtask = base.is_final_subtask()
 
         print(timestep, info)
 

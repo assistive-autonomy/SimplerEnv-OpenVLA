@@ -1,10 +1,15 @@
+def _base_env(env):
+    return getattr(env, "unwrapped", env)
+
 def get_image_from_maniskill2_obs_dict(env, obs, camera_name=None):
-    # obtain image from observation dictionary returned by ManiSkill2 environment
+    base = _base_env(env)
+
     if camera_name is None:
-        if "google_robot" in env.robot_uid:
+        if "google_robot" in base.robot_uid:
             camera_name = "overhead_camera"
-        elif "widowx" in env.robot_uid:
+        elif "widowx" in base.robot_uid:
             camera_name = "3rd_view_camera"
         else:
-            raise NotImplementedError()
+            raise NotImplementedError(f"Unknown robot_uid={getattr(base,'robot_uid',None)}")
+
     return obs["image"][camera_name]["rgb"]

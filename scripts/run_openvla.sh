@@ -1,3 +1,6 @@
+export DISPLAY=${DISPLAY:-:1}
+export XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority}
+
 model_name=openvla
 tasks=(
   bridge.sh
@@ -12,7 +15,7 @@ tasks=(
 )
 
 ckpts=(
-  ~/projects/vla_ptm/pretrained/openvla-7b
+  /media/vla/My_Passport/vla_models/OpenVLA/openvla-7b
 )
 
 action_ensemble_temp=-0.8
