@@ -6,6 +6,7 @@ _ext
 build/
 dist/
 *.egg-info/
+results/
 
 # ipython/jupyter notebooks
 # *.ipynb
