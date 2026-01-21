@@ -15,7 +15,7 @@ tasks=(
 )
 
 ckpts=(
-  /media/vla/My_Passport/vla_models/OpenVLA/openvla-7b
+  openvla/openvla-7b
 )
 
 action_ensemble_temp=-0.8
