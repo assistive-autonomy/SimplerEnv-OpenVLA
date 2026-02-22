@@ -13,9 +13,59 @@ import numpy as np
 import torch
 
 def auto_model_fn(path):
-    import sys; sys.path.append(path) # noqa
-    from modeling_pi0 import PI0Policy
-    return PI0Policy
+    """
+    Return the correct LeRobot policy class for pi0 / pi0-fast checkpoints.
+    Prefer installed LeRobot package classes, fallback to local modeling files.
+    """
+    import os
+    import json
+    from pathlib import Path
+
+    # Try to inspect config.json if path is local
+    cfg = {}
+    cfg_path = Path(path) / "config.json"
+    if cfg_path.exists():
+        try:
+            with open(cfg_path, "r") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+
+    # Heuristics for pi0-fast vs pi0
+    cfg_text = str(cfg).lower()
+    is_pi0_fast = (
+        "pi0fast" in str(path).lower()
+        or "pi0_fast" in str(path).lower()
+        or "pi0fast" in cfg_text
+        or "pi0_fast" in cfg_text
+        or "pi0fastconfig" in cfg_text
+    )
+
+    # 1) Installed LeRobot package (preferred)
+    try:
+        if is_pi0_fast:
+            from lerobot.policies.pi0_fast.modeling_pi0_fast import PI0FastPolicy
+            return PI0FastPolicy
+        else:
+            from lerobot.policies.pi0.modeling_pi0 import PI0Policy
+            return PI0Policy
+    except Exception:
+        pass
+
+    # 2) Fallback: local checkpoint folder contains modeling file(s)
+    import sys
+    if os.path.isdir(path):
+        sys.path.append(path)
+        if is_pi0_fast:
+            try:
+                from modeling_pi0_fast import PI0FastPolicy  # type: ignore
+                return PI0FastPolicy
+            except Exception:
+                pass
+        from modeling_pi0 import PI0Policy  # type: ignore
+        return PI0Policy
+
+    raise ImportError(f"Could not resolve PI0/Pi0Fast policy class for checkpoint: {path}")
 
 class LerobotPiFastInference:
     def __init__(
@@ -53,8 +103,8 @@ class LerobotPiFastInference:
         print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
 
         # TODO: add pi0 loading ...
-        PI0Policy = auto_model_fn(saved_model_path)
-        self.vla = PI0Policy.from_pretrained(saved_model_path, map_location=self.device)
+        PolicyCls = auto_model_fn(saved_model_path)
+        self.vla = PolicyCls.from_pretrained(saved_model_path, map_location=self.device)
         self.vla.reset()
 
         self.image_size = image_size
