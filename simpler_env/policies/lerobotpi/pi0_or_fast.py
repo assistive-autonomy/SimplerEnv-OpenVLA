@@ -185,6 +185,413 @@ class LerobotPiFastInference:
         )
         return raw_proprio
 
+    def _extract_rgb_from_camera_entry(self, cam_entry):
+        """
+        ManiSkill obs['image'][camera_name] is typically a dict containing rgb/rgbd tensors.
+        Return HxWx3 uint8 RGB numpy array.
+        """
+        if cam_entry is None:
+            return None
+
+        if isinstance(cam_entry, dict):
+            # Common keys across ManiSkill variants
+            for k in ["rgb", "Color", "color"]:
+                if k in cam_entry:
+                    rgb = cam_entry[k]
+                    break
+            else:
+                rgb = None
+        else:
+            rgb = cam_entry
+
+        if rgb is None:
+            return None
+
+        rgb = np.asarray(rgb)
+
+        # If batched or weird shape, squeeze singleton dims
+        rgb = np.squeeze(rgb)
+
+        # Convert float [0,1] to uint8 if needed
+        if rgb.dtype != np.uint8:
+            rgb = np.clip(rgb, 0, 1) if np.issubdtype(rgb.dtype, np.floating) else rgb
+            if np.issubdtype(rgb.dtype, np.floating):
+                rgb = (rgb * 255.0).astype(np.uint8)
+            else:
+                rgb = rgb.astype(np.uint8)
+
+        # If RGBA, drop alpha
+        if rgb.ndim == 3 and rgb.shape[-1] == 4:
+            rgb = rgb[..., :3]
+
+        if rgb.ndim != 3 or rgb.shape[-1] != 3:
+            raise ValueError(f"Unexpected RGB shape from camera entry: {rgb.shape}")
+
+        return rgb
+
+
+    def _checkpoint_image_feature_keys(self):
+        """
+        Return image feature keys expected by the loaded LeRobot policy checkpoint.
+        """
+        cfg = getattr(self.vla, "config", None)
+        input_features = getattr(cfg, "input_features", None)
+
+        keys = []
+        if isinstance(input_features, dict):
+            for k, feat in input_features.items():
+                feat_type = getattr(feat, "type", None)
+                # FeatureType.VISUAL enum string repr can vary; compare robustly
+                if feat_type is not None and "VISUAL" in str(feat_type):
+                    keys.append(k)
+
+        return keys
+
+    def _build_language_observation(self, task_description: str):
+        """
+        Build PI0/PI0Fast language tokens in the keys expected by LeRobot:
+        - observation.language.tokens
+        - observation.language.attention_mask
+        """
+        import torch
+        from transformers import AutoTokenizer
+
+        if task_description is None:
+            task_description = ""
+        if not isinstance(task_description, str):
+            task_description = str(task_description)
+
+        candidates = []
+
+        def _add(label, obj):
+            if obj is not None:
+                candidates.append((label, obj))
+
+        # direct attrs on wrapper
+        _add("self.processor", getattr(self, "processor", None))
+        _add("self.tokenizer", getattr(self, "tokenizer", None))
+
+        vla = getattr(self, "vla", None)
+        if vla is not None:
+            # direct attrs on vla
+            for name in ("processor", "tokenizer", "text_tokenizer"):
+                _add(f"self.vla.{name}", getattr(vla, name, None))
+
+            # nested attrs on vla modules
+            for parent_name in ("model", "paligemma_with_expert", "paligemma"):
+                parent = getattr(vla, parent_name, None)
+                if parent is None:
+                    continue
+                for name in ("processor", "tokenizer", "text_tokenizer"):
+                    _add(f"self.vla.{parent_name}.{name}", getattr(parent, name, None))
+
+            # inspect action_tokenizer internals (do NOT call action_tokenizer directly on text)
+            actp = getattr(vla, "action_tokenizer", None)
+            if actp is not None:
+                print("DEBUG found self.vla.action_tokenizer:", type(actp))
+                for name in ("tokenizer", "text_tokenizer", "base_tokenizer", "llm_tokenizer", "processor"):
+                    _add(f"self.vla.action_tokenizer.{name}", getattr(actp, name, None))
+
+                inner_proc = getattr(actp, "processor", None)
+                if inner_proc is not None:
+                    _add("self.vla.action_tokenizer.processor.tokenizer", getattr(inner_proc, "tokenizer", None))
+                    _add("self.vla.action_tokenizer.processor.text_tokenizer", getattr(inner_proc, "text_tokenizer", None))
+
+            # fallback: try loading tokenizer from config text model name
+            cfg = getattr(vla, "config", None)
+            text_model_candidates = []
+            if cfg is not None:
+                for attr in ("text_config", "vlm_config_hf", "vlm_config"):
+                    sub = getattr(cfg, attr, None)
+                    if sub is None:
+                        continue
+                    for name_attr in ("_name_or_path", "name_or_path", "model_name_or_path"):
+                        nm = getattr(sub, name_attr, None)
+                        if isinstance(nm, str) and nm.strip():
+                            text_model_candidates.append(nm)
+
+                    sub_text = getattr(sub, "text_config", None)
+                    if sub_text is not None:
+                        for name_attr in ("_name_or_path", "name_or_path", "model_name_or_path"):
+                            nm = getattr(sub_text, name_attr, None)
+                            if isinstance(nm, str) and nm.strip():
+                                text_model_candidates.append(nm)
+
+            text_model_candidates = list(dict.fromkeys(text_model_candidates))
+            if text_model_candidates:
+                print("DEBUG tokenizer fallback model candidates:", text_model_candidates)
+            for model_name in text_model_candidates:
+                try:
+                    tok = AutoTokenizer.from_pretrained(model_name, local_files_only=False)
+                    _add(f"AutoTokenizer.from_pretrained({model_name})", tok)
+                    break
+                except Exception as e:
+                    print(f"DEBUG tokenizer fallback failed for {model_name}: {repr(e)}")
+
+        # dedup
+        dedup = []
+        seen = set()
+        for label, obj in candidates:
+            oid = id(obj)
+            if oid in seen:
+                continue
+            seen.add(oid)
+            dedup.append((label, obj))
+        candidates = dedup
+
+        if not candidates:
+            raise RuntimeError(
+                "Could not find a text tokenizer/processor for PI0Fast. "
+                "Checked self/self.vla and self.vla.action_tokenizer internals."
+            )
+
+        def _normalize_output(enc):
+            if hasattr(enc, "data") and isinstance(enc.data, dict):
+                data = enc.data
+            elif isinstance(enc, dict):
+                data = enc
+            else:
+                raise TypeError(f"Unsupported tokenizer output type: {type(enc)}")
+
+            input_ids = data.get("input_ids")
+            attention_mask = data.get("attention_mask")
+
+            if input_ids is None:
+                raise KeyError(f"No input_ids in tokenizer output. Keys: {list(data.keys())}")
+
+            if not torch.is_tensor(input_ids):
+                input_ids = torch.tensor(input_ids, dtype=torch.long)
+            else:
+                input_ids = input_ids.to(dtype=torch.long)
+            if input_ids.ndim == 1:
+                input_ids = input_ids.unsqueeze(0)
+
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+            elif not torch.is_tensor(attention_mask):
+                attention_mask = torch.tensor(attention_mask, dtype=torch.long)
+            else:
+                attention_mask = attention_mask.to(dtype=torch.long)
+            if attention_mask.ndim == 1:
+                attention_mask = attention_mask.unsqueeze(0)
+
+            return {
+                "observation.language.tokens": input_ids.to(self.device),
+                "observation.language.attention_mask": attention_mask.to(self.device),
+            }
+
+        last_err = None
+        for label, tok in candidates:
+            # Skip the action processor object itself (it is not a text tokenizer)
+            if label == "self.vla.action_tokenizer":
+                continue
+
+            # Try processor/tokenizer call styles
+            for call_style in ("positional", "text_kw"):
+                try:
+                    if call_style == "positional":
+                        enc = tok([task_description], return_tensors="pt", padding=True, truncation=True)
+                    else:
+                        enc = tok(text=[task_description], return_tensors="pt", padding=True, truncation=True)
+                    out = _normalize_output(enc)
+                    print(f"DEBUG language tokenizer used: {label} ({call_style})")
+                    return out
+                except Exception as e:
+                    last_err = e
+
+            # If tok is processor-like and has .tokenizer, try that
+            try:
+                inner_tok = getattr(tok, "tokenizer", None)
+                if inner_tok is not None:
+                    enc = inner_tok([task_description], return_tensors="pt", padding=True, truncation=True)
+                    out = _normalize_output(enc)
+                    print(f"DEBUG language tokenizer used: {label}.tokenizer")
+                    return out
+            except Exception as e:
+                last_err = e
+
+        raise RuntimeError(
+            "Failed to build language tokens for PI0Fast. "
+            f"Last error: {repr(last_err)}. "
+            f"Tried candidates: {[label for label, _ in candidates]}"
+        )
+
+    def _build_visual_observation_from_camera_obs(self, camera_obs):
+        """
+        Build the visual observation dict expected by the PI0/PI0Fast checkpoint.
+
+        This version supports a fallback/alias mode for envs that do NOT provide
+        wrist cameras (e.g. only base_camera + overhead_camera). It will duplicate
+        available views into the checkpoint's expected feature keys so the pipeline
+        can run for smoke-testing/debugging.
+
+        Expected checkpoint keys (example):
+        - observation.images.base_0_rgb
+        - observation.images.left_wrist_0_rgb
+        - observation.images.right_wrist_0_rgb
+        """
+        import numpy as np
+        import torch
+
+        if camera_obs is None:
+            raise ValueError("camera_obs is None")
+
+        if not isinstance(camera_obs, dict):
+            raise ValueError(f"camera_obs must be dict-like, got {type(camera_obs)}")
+
+        # --- helpers -------------------------------------------------------------
+        def _to_chw_float_tensor(img_np):
+            """HWC uint8/float -> BCHW float32 in [0,1] on self.device."""
+            arr = np.asarray(img_np)
+
+            # Handle possible batch dimension accidentally present
+            if arr.ndim == 4 and arr.shape[0] == 1:
+                arr = arr[0]
+
+            if arr.ndim != 3:
+                raise ValueError(f"Expected image with 3 dims (H,W,C), got shape {arr.shape}")
+
+            # Some envs may provide RGBA; drop alpha
+            if arr.shape[-1] == 4:
+                arr = arr[..., :3]
+
+            if arr.shape[-1] != 3:
+                raise ValueError(f"Expected image channel-last RGB/RGBA, got shape {arr.shape}")
+
+            # Ensure uint8-like normalization
+            arr = arr.astype(np.float32)
+            if arr.max() > 1.0:
+                arr = arr / 255.0
+            arr = np.clip(arr, 0.0, 1.0)
+
+            # Resize using existing model helper (expects HWC uint8 usually), so do a safe path:
+            # convert back to uint8 for consistency with current preprocessing pipeline
+            arr_u8 = (arr * 255.0).astype(np.uint8)
+            arr_u8 = self._resize_image(arr_u8)
+
+            ten = torch.from_numpy(arr_u8).permute(2, 0, 1).unsqueeze(0).to(self.device).float() / 255.0
+            return ten
+
+        def _extract_rgb(cam_entry):
+            """
+            Try common ManiSkill/SimplerEnv camera entry layouts.
+            cam_entry is often a dict/OrderedDict with keys like rgb, Color, etc.
+            """
+            if cam_entry is None:
+                return None
+
+            # Already an image array?
+            if isinstance(cam_entry, np.ndarray):
+                return cam_entry
+
+            if isinstance(cam_entry, dict):
+                # Common key guesses in priority order
+                candidate_keys = [
+                    "rgb",
+                    "RGB",
+                    "color",
+                    "Color",
+                    "rgb_image",
+                    "image",
+                ]
+                for k in candidate_keys:
+                    if k in cam_entry and cam_entry[k] is not None:
+                        return cam_entry[k]
+
+                # If nested unexpectedly, try first ndarray value
+                for v in cam_entry.values():
+                    if isinstance(v, np.ndarray):
+                        return v
+
+            return None
+
+        # --- inspect checkpoint-required visual feature keys ---------------------
+        # PI0Fast stores feature schema in config; try robust access patterns.
+        image_feature_keys = []
+        try:
+            # Newer LeRobot configs often expose input_features dict
+            feats = getattr(self.vla.config, "input_features", None)
+            if isinstance(feats, dict):
+                for k, v in feats.items():
+                    # v may be a dataclass-like object with .type == VISUAL
+                    vtype = getattr(v, "type", None)
+                    vtype_str = str(vtype)
+                    if "VISUAL" in vtype_str and k.startswith("observation.images."):
+                        image_feature_keys.append(k)
+        except Exception:
+            image_feature_keys = []
+
+        # Fallback if schema lookup fails
+        if not image_feature_keys:
+            image_feature_keys = ["observation.images.image"]
+
+        # --- collect available env camera RGBs -----------------------------------
+        available = {}
+        for cam_name, cam_entry in camera_obs.items():
+            rgb = _extract_rgb(cam_entry)
+            if rgb is not None:
+                available[cam_name] = rgb
+
+        if len(available) == 0:
+            raise ValueError(
+                f"No RGB images found in camera_obs. camera_obs keys={list(camera_obs.keys())}"
+            )
+
+        # Helpful debug (keep/remove as you prefer)
+        print("DEBUG camera_obs keys in step:", list(camera_obs.keys()))
+        print("DEBUG extracted RGB camera keys:", list(available.keys()))
+        print("DEBUG checkpoint image features:", image_feature_keys)
+
+        # Prefer these env camera names if present
+        base_img = available.get("base_camera", None)
+        overhead_img = available.get("overhead_camera", None)
+
+        # Fallbacks if names differ
+        if base_img is None and len(available) > 0:
+            # take first camera as base fallback
+            first_key = next(iter(available.keys()))
+            base_img = available[first_key]
+
+        if overhead_img is None:
+            # choose a different camera than base if possible, else duplicate base
+            overhead_img = None
+            for k, v in available.items():
+                if v is not base_img:
+                    overhead_img = v
+                    break
+            if overhead_img is None:
+                overhead_img = base_img
+
+        # --- build observation dict keyed exactly as checkpoint expects ----------
+        visual_obs = {}
+
+        for feat_key in image_feature_keys:
+            # Direct single-image schemas (older/simple wrappers)
+            if feat_key == "observation.images.image":
+                visual_obs[feat_key] = _to_chw_float_tensor(base_img)
+                continue
+
+            # Multi-camera schemas (PI0Fast / Google-style)
+            if "base_0_rgb" in feat_key:
+                visual_obs[feat_key] = _to_chw_float_tensor(base_img)
+            elif "left_wrist_0_rgb" in feat_key:
+                # Smoke-test alias: duplicate base if wrist cam absent
+                source = available.get("left_wrist_camera", None)
+                if source is None:
+                    source = base_img
+                visual_obs[feat_key] = _to_chw_float_tensor(source)
+            elif "right_wrist_0_rgb" in feat_key:
+                # Smoke-test alias: use overhead if present, else duplicate base
+                source = available.get("right_wrist_camera", None)
+                if source is None:
+                    source = overhead_img
+                visual_obs[feat_key] = _to_chw_float_tensor(source)
+            else:
+                # Generic fallback: if an unknown image feature is requested, feed base camera
+                visual_obs[feat_key] = _to_chw_float_tensor(base_img)
+
+        return visual_obs
+
     def step(
         self, image: np.ndarray, task_description: Optional[str] = None, *args, **kwargs
     ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
@@ -204,6 +611,15 @@ class LerobotPiFastInference:
             if task_description != self.task_description:
                 self.reset(task_description)
 
+        camera_obs = kwargs.get("camera_obs", None)
+        eef_pos = kwargs.get("eef_pos", None)
+        print("DEBUG wrapper eef_pos in step:", eef_pos, type(eef_pos), getattr(eef_pos, "shape", None))
+        if isinstance(camera_obs, dict):
+            print("DEBUG camera_obs keys in step:", list(camera_obs.keys()))
+	
+        eef_pos = kwargs.get("eef_pos", None)
+        print("DEBUG wrapper eef_pos in step:", eef_pos, type(eef_pos), getattr(eef_pos, "shape", None))
+            
         assert image.dtype == np.uint8
         image = self._resize_image(image)
         self._add_image_to_history(image)
@@ -221,13 +637,25 @@ class LerobotPiFastInference:
         #     raw_actions = self.action_ensembler.ensemble_action(raw_actions)[None]
 
         if not self.action_plan:
+            # state is currently a numpy array from preprocess_*; convert once here
+            state_t = torch.from_numpy(state).unsqueeze(0).to(self.device).float()
+
+            # Build real camera features matching checkpoint schema
+            visual_obs = self._build_visual_observation_from_camera_obs(camera_obs)
+
+            # Build tokenized language inputs expected by PI0/PI0Fast
+            lang_obs = self._build_language_observation(task_description)
+
+            # Final batch for PI0Fast
             observation = {
-                "observation.state": torch.from_numpy(state).unsqueeze(0).to(self.device).float(),
-                image_key: torch.from_numpy(images[0] / 255).permute(2, 0, 1).unsqueeze(0).to(self.device).float(),
-                "task": [task_description], 
+                "observation.state": state_t,
+                **visual_obs,
+                **lang_obs,
             }
 
-            # model output gripper action, +1 = open, 0 = close
+            # Optional debug
+            print("DEBUG observation keys for PI0Fast:", list(observation.keys()))
+
             action_chunk = self.vla.select_action(observation)[0][:self.pred_action_horizon].cpu().numpy()
             self.action_plan.extend(action_chunk[: self.exec_horizon])
 
